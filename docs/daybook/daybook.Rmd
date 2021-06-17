@@ -1,0 +1,55 @@
+---
+title: "MSc Daybook-Summer 2021"
+author: "Ben Nolan (15386266)"
+date: "9/6/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Week 1
+
+## 8/6/2021
+
+1. Created project plan on google slides. I have 10 weeks to get this done.
+2. Single patient data was downloaded onto my laptop.
+
+```{bash, eval=F}
+#1. 
+#https://docs.google.com/presentation/d/1yLea7JWD_QlRqPA_F99z_UAU6sfRuL22yLR33WutDpg/edit#slide=id.p
+#2.
+for i in {04..16}; do parallel-fastq-dump --sra-id SRR66711$i --threads 4 --outdir luminal_singlepatient/ --split-files --gzip; done
+```
+
+
+## 9/6/2021
+
+1. Downloaded MA5112 rna-seq kallisto nextflow script and Rmd analysis script. Familiarised myself with RNA-seq analysis including kallisto and R components ~ **"MA5112_rna-seq.Rmd"**
+2. Nextflow script is working properly so need to fix that. Base name is SRA_1 and not SRA Ans. **Always surround glob patterns with quotes.**
+3. Now to download the SRAs to LUGH and run kallisto over there, will see if there's a **module load fastq-dump** on there. 
+
+```{bash eval=F}
+#2.
+nextflow run rna-seq.nf --input "/Users/bennolan/Desktop/msc_project/data/luminal_singlepatient/*_{1,2}*.fastq.gz" --input_type 'paired-end' --fasta /Users/bennolan/Desktop/msc_project/results/reference/GRCh38.cdna.fa --outdir /Users/bennolan/Desktop/msc_project/results/luminal_quant/ --cpus 4 --index /Users/bennolan/Desktop/msc_project/results/luminal_quant/index/GRCh38.fa.idx
+```
+
+## 10/6/2021
+
+1. Tried to use conda to download parallel-fastq-dump on Lugh, permission error. All MSc students conda's were set to **/home/mscstudent/anaconda3**. I commented out the anaconda lines in the *~/.bashrc*, reinstalled conda and then parallel-fastq-dump
+2. Download SRA data.
+3. Ready to begin kallisto when SRAs are finished downloading.
+4. Set up latex for the manuscript. 
+
+```{bash, eval=F}
+#1.
+wget https://repo.anaconda.com/archive/Anaconda3-2021.05-Linux-x86_64.sh
+bash Anaconda3-2021.05-Linux-x86_64.sh
+conda install -c bioconda parallel-fastq-dump
+#2.
+for i in {04..16}; do parallel-fastq-dump --sra-id SRR66711$i --threads 4 --outdir luminal_singlepatient/ --split-files --gzip; done
+#3.
+nextflow -bg run rna-seq.nf --input "/Users/bennolan/Desktop/msc_project/data/luminal_singlepatient/*_{1,2}*.fastq.gz" --input_type 'paired-end' --fasta --with-singularity RNA-seq.img
+```
+

@@ -1,0 +1,261 @@
+---
+title: "RSI and GARD calculation and data visualisation of GSE110114"
+author: "Ben Nolan"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  pdf_document: default
+  html_document: default
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### General Information
+
+**ID:** PRJNA432903; GEO: GSE110114
+**DATA:** https://www.ncbi.nlm.nih.gov/Traces/study/?acc=PRJNA432903&o=acc_s%3Aa
+
+**Methodology:** Performed RNA-seq with ten pieces of breast cancer (invasive ductal carcinoma; luminal B type) tissue and three pieces of adjacent normal tissue from a single patient. These RNA-seq data were used to evaluate the performance of splice-aware aligners. 
+
+Overall design: RNA-seq was performed with 10 pieces of breast cancer tissue and 3 pieces of adjacent normal tissue obtained from a single patient. Used Illumina HiSeq 2500 for the sequencing.
+
+## Libraries
+
+```{R, message=F, warning=F}
+library(biomaRt)
+library(tximport)
+library(tidyverse)
+library(edgeR)
+library(cowplot)
+```
+
+
+## Downloading the data
+
+```{bash, eval=FALSE}
+for i in {04..16}; do parallel-fastq-dump --sra-id SRR66711$i --threads 4 --outdir luminal_singlepatient/ --split-files --gzip; done
+```
+
+**Total 10:** *4..13:* Tumour tissue
+
+**Total 3:** *14, 15, 16:* Adjacent normal tissue
+
+# R analysis
+
+### Transcript Quantification
+
+Create Sample table and csv of SRAs as rows with condition, replicate as columns
+
+```{r}
+#sample.csv was created manually in excel
+samples <- read.csv("~/Desktop/rsi_analysis/results/sample.csv", header=T, stringsAsFactors = T)
+rownames(samples) <- samples$X
+samples$X <- NULL
+samples
+```
+
+
+```{r}
+#point towards directory containing kallisto results
+dir <- ("~/Desktop/rsi_analysis/results/quant/")
+files <- file.path(dir, rownames(samples), "abundance.h5") 
+names(files) <- paste0(rownames(samples)) 
+files
+```
+
+
+### BiomaRt
+Connects to `ENSEMBL` databases to map transcript IDs to gene IDs.
+
+```{R, warning=F, message=F}
+mart <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+```
+
+```{R, message=F, warning=F}
+tx2gene <- getBM(attributes = c("ensembl_transcript_id_version", "hgnc_symbol"), mart = mart, useCache = FALSE)
+head(tx2gene)
+```
+
+### TXI object
+Creates a `txi` object summarising `kallisto` transcipt quantification to the gene-level.
+```{R, message=F, warning=F}
+txi <- tximport(files = files, type = "kallisto", tx2gene = tx2gene)
+```
+
+### Normalization
+
+`edgeR` normalizes the transcript count (`txi`) by calculating scaling factors to convert raw library sizes into effective library sizes, followed by Trimmed Mean of M-values (TMM). [https://www.ncbi.nlm.nih.gov/pubmed/22988256]. The data is normalized by counts per million reads (CPM).
+
+```{r}
+y <- DGEList(txi$counts) #create DGE object
+y <- calcNormFactors(y) 
+filteredExpr <- cpm(y, log=T) #normalize with counts per million reads
+```
+
+
+## RSI and GARD calculation
+
+Using the normalized transcript count dataframe, calculates the **radiosensitivity index (RSI)** and **genomically adjusted raditherapy dose (GARD)** for each sample in the dataframe.
+
+```{r}
+#calculate RSI for each sample in a normalized gene expression df
+calc_RSI_GARD<-function(geneExpr.df){
+  
+  #10 genes for RSI
+  rsi_genes <- c("AR", "JUN", "STAT1", "PRKCB", "RELA", "ABL1", "SUMO1", "CDK1", "HDAC1", "IRF1")
+  
+  #samples as rows and take the rsi gene entries
+  rsi.all <- as.data.frame(t(geneExpr.df[which(rownames(geneExpr.df) %in% rsi_genes),]))
+  #retrive gene expression for a given gene + sample number
+  getExp <- function(gene, samplenum){
+    expression = as.numeric(rsi.all[,which(colnames(rsi.all) == gene)][samplenum])
+    return(expression)
+  }
+  
+  rsi.all$RSI <- 0
+  #calculate RSI for each sample in df 
+  for(i in 1:nrow(rsi.all)){
+    T1 = -0.0098009*getExp("AR", i) #AR
+    T2 = 0.0128283*getExp("JUN", i) #JUN
+    T3 = 0.0254522*getExp("STAT1", i) #STAT1
+    T4 = -0.0017589*getExp("PRKCB", i) #PRKCB
+    T5 = -0.0038171*getExp("RELA", i) #RELA
+    T6 = 0.1070213*getExp("ABL1", i) #ABL1
+    T7 = -0.0002509*getExp("SUMO1", i) #SUMO1
+    T8 = -0.0092431*getExp("CDK1", i) #CDK1
+    T9 = -0.0204469*getExp("HDAC1", i) #HDAC1
+    T10 = -0.0441683*getExp("IRF1", i)  #IRF1
+    
+    RSI = T1 + T2 + T3 + T4 + T5 + T6 + T7 + T8 + T9 + T10
+    #add RSI value for each sample in dataframe
+    rsi.all[i,]$RSI <- RSI
+  }
+  
+  rsi.all<-add_column(rsi.all, 'alpha' = NA)
+  rsi.all<-add_column(rsi.all, 'gard'  = NA)
+  #dosage(Gray)
+  d=2
+  #n fractions
+  n=25
+
+  rsi.all <- rsi.all %>%
+    mutate(alpha=log(RSI)/(-2) - 0.05*2) %>%
+    mutate(gard=n*d*(alpha + 0.05*d))
+  
+return(rsi.all)
+}
+
+```
+
+### Calculate RSI and GARD using Normalized gene expression data
+
+```{r}
+rsi.all <- calc_RSI_GARD(filteredExpr) #calculate RSI with normalized counts
+rsi.all
+```
+
+## Data Visualisation
+
+### Mean RSI for tumour vs normal
+
+Bar plot with error bars describing the mean RSI between tumour and normal samples.
+
+```{r}
+#merge rsi.all and samples by row (samples).
+rsi.all.condition <- merge(rsi.all, samples, by=0)
+#merge creates row.names column, revert rownames back to samples
+colnames(rsi.all.condition)[1] <- 'sample'
+```
+
+
+```{r}
+#rsi,mean and std dataframe for visualisation
+rsi.tum_v_norm = rsi.all.condition %>%
+  group_by(condition) %>%
+  summarise(value = mean(RSI),
+            error = sd(RSI))
+```
+
+
+```{r}
+g1 <- ggplot(rsi.tum_v_norm, aes(x=condition, y=value, fill=condition)) +
+  geom_col(width = .3)  +
+
+  scale_fill_manual(values=c(green, orange)) +
+  scale_y_continuous(breaks = seq(0,.6,.1)) +
+
+  #add error bars 
+  geom_errorbar(aes(ymin = value-error, ymax = value+error), 
+                position = position_dodge(0.9), width = .1)+
+  
+  
+  theme_bw() +
+  ggtitle("RSI: Normal vs Tumour") +
+  ylab("RSI")+
+  
+  theme(
+      axis.line.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      axis.line.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.title.x = element_blank(),
+      panel.grid.major.y = element_line(size = 0.2, linetype = 'solid',colour = "lightgrey")
+    )
+
+g1
+```
+
+
+### RSI across all samples
+
+Produce a scatterplot of the **RSI** across all samples in the dataset. 
+
+```{r}
+#change rownames to column for ggplot
+rsi.all <- rownames_to_column(rsi.all, "sample")
+```
+
+```{r}
+#setting desired colours
+orange <- "#DBA237"
+green <- "#D3E4D0"
+col <- c(rep(orange, 10), rep("green", 3))
+
+#
+g2 <- ggplot(rsi.all, aes(x=sample, y=RSI, color = sample)) +
+  geom_point() +
+  
+  scale_colour_manual(values=col) +
+  
+  theme_bw() +
+  
+  ggtitle("RSI across all samples") +
+  
+  theme(
+      axis.line.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      axis.line.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+      axis.title.x = element_blank(),
+      legend.position = "none",
+      plot.margin = margin(3, 6, 3, 3),
+      panel.grid.major.y = element_line(size = 0.2, linetype = 'solid',colour = "lightgrey")
+      
+    )
+
+g2
+```
+
+
+
+```{r}
+#use cowplot:plot_grid for grid plot layout
+g_grid <- plot_grid(g2, g1, labels = "AUTO")
+g_grid
+```
+
+
