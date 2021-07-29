@@ -1,0 +1,519 @@
+---
+title: "RSI and GARD calculation and data visualisation of Breast Cancer (1 patient:10 tumour/ 3 normal) GSE110114 and Prostate Cancer dataset (14 patients:1 tumour/1 normal per patient)"
+author: "Ben Nolan"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  pdf_document: default
+  html_document: default
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## General Information
+
+### Breast Cancer 1 Patient Dataset
+
+**ID:** PRJNA432903; GEO: GSE110114
+**DATA:** https://www.ncbi.nlm.nih.gov/Traces/study/?acc=PRJNA432903&o=acc_s%3Aa
+
+**Methodology:** Performed RNA-seq with ten pieces of breast cancer (invasive ductal carcinoma; luminal B type) tissue and three pieces of adjacent normal tissue from a single patient. These RNA-seq data were used to evaluate the performance of splice-aware aligners. 
+
+Overall design: RNA-seq was performed with 10 pieces of breast cancer tissue and 3 pieces of adjacent normal tissue obtained from a single patient. Used Illumina HiSeq 2500 for the sequencing.
+
+### Prostate Cancer 14 Patient Dataset
+
+...
+
+## Libraries
+
+```{R, message=F, warning=F}
+library(biomaRt)
+library(tximport)
+library(tidyverse)
+library(edgeR)
+library(cowplot)
+library(ballgown)
+library(DESeq2)
+library(gtools)
+```
+
+
+## Downloading the data
+
+### Luminal
+
+```{bash, eval=FALSE}
+for i in {04..16}; do parallel-fastq-dump --sra-id SRR66711$i --threads 4 --outdir luminal_singlepatient/ --split-files --gzip; done
+```
+
+**Total 10:** Tumour tissue
+
+**Total 3:** Adjacent normal tissue
+
+### Prostate
+
+```{bash, eval=FALSE}
+while read -r accession; do parallel-fastq-dump --sra-id $accession --threads 6 --outdir /data/bnolan/project/data/prostate/prostate_14 --split-files --gzip; done < SRR_Acc_List.txt
+```
+
+**Total 14:**  Tumour tissue
+
+**Total 14:**  Adjacent normal tissue
+
+
+# R analysis
+
+## Data Input
+
+### Metadata 
+
+Create Sample table and csv of SRAs as rows with condition, replicate as columns
+
+#### Luminal (Breast Cancer Dataset)
+
+```{r}
+#sample.csv was created manually in excel
+samples_l <- read.csv("~/Desktop/rsi_analysis/results/luminal/sample.csv", header=T, stringsAsFactors = T)
+rownames(samples_l) <- samples_l$X
+samples_l$X <- NULL
+samples_l <- samples_l[-c(which(rownames(samples_l)=='SRR6671107')),] #remove SRR6671107 as due to low TIN score
+```
+
+#### Prostate Dataset
+
+```{r}
+#sample.csv was created manually in excel
+samples_p <- read.csv("~/Desktop/rsi_analysis/results/prostate/sample.csv", header=T, stringsAsFactors = T)
+rownames(samples_p) <- samples_p$Run
+samples_p$Run <- NULL
+```
+
+### featureCounts
+
+featureCounts was used in the pre-processing Nextflow script and returns a matrix containing raw count data at the gene level for input RNA transcripts. Below, count data is read in, organised and annotated by gene name.
+
+#### Luminal
+
+##### Read in Data
+
+```{r}
+#read in count data
+file <- "~/Desktop/rsi_analysis/results/luminal/luminal.counts.txt"
+luminal <- read.table(file, header = T, stringsAsFactors = F)
+# assign row.names as ensembl id
+rownames(luminal) <- luminal$Geneid
+# exclude superfluous columns
+luminal <- luminal[, -c(1:6)] 
+#rename columns as accession
+names(luminal) <- sub("^.*(SRR\\d+).bam$", "\\1", names(luminal))
+#order countData as in samples.csv metadata file
+luminal <- luminal %>%
+  dplyr::select(rownames(samples_l))
+```
+
+##### Annotate
+
+```{r}
+#annotate dataframe with gene name as opposed to ensembl id
+#obtain bioMart metadata
+#mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+gene_list <- getBM(filters= "ensembl_gene_id", attributes= c("ensembl_gene_id","hgnc_symbol"),values=rownames(luminal),mart= mart)
+#obtain index for gene name for each gene id
+m <- match(rownames(luminal),gene_list$ensembl_gene_id)
+#create gene column
+luminal$gene <- gene_list$hgnc_symbol[m]
+#assign rownames as gene names, many gene names have duplicated gene ids but RSI genes do not.
+rownames(luminal) <- ifelse(duplicated(luminal$gene), rownames(luminal), luminal$gene)
+luminal$gene<-NULL
+```
+
+#### Prostate
+
+##### Read in Data
+
+```{r}
+#read in count data
+file <- "~/Desktop/rsi_analysis/results/prostate/prostate.counts.txt"
+prostate <- read.table(file, header = T, stringsAsFactors = F)
+# assign row.names as ensembl id
+rownames(prostate) <- prostate$Geneid
+# exclude superfluous columns
+prostate <- prostate[, -c(1:6)] 
+#rename columns as accession
+names(prostate) <- sub("^.*(ERR\\d+).bam$", "\\1", names(prostate))
+#order countData as in samples.csv metadata file
+prostate <- prostate %>%
+  dplyr::select(rownames(samples_p))
+```
+
+##### Annotate
+
+```{r}
+#annotate dataframe with gene name as opposed to ensembl id
+#obtain bioMart metadata
+#mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+gene_list <- getBM(filters= "ensembl_gene_id", attributes= c("ensembl_gene_id","hgnc_symbol"),values=rownames(prostate),mart= mart)
+#obtain index for gene name for each gene id
+m <- match(rownames(prostate),gene_list$ensembl_gene_id)
+#create gene column
+prostate$gene <- gene_list$hgnc_symbol[m]
+#assign rownames as gene names, many gene names have duplicated gene ids but RSI genes do not.
+rownames(prostate) <- ifelse(duplicated(prostate$gene), rownames(prostate), prostate$gene)
+prostate$gene<-NULL
+```
+
+### Normalization
+
+#### CPM
+
+`edgeR` normalizes the transcript count (`txi`) by calculating scaling factors to convert raw library sizes into effective library sizes, followed by Trimmed Mean of M-values (TMM). [https://www.ncbi.nlm.nih.gov/pubmed/22988256]. The data is normalized by counts per million reads (CPM).
+
+Use of CPM from edgeR's TMM method is recommended: [https://hbctraining.github.io/DGE_workshop/lessons/02_DGE_count_normalization.html]
+
+##### Luminal
+
+```{r}
+y <- DGEList(luminal) #create DGE object
+y <- calcNormFactors(y) 
+luminal_cpm <- cpm(y, log=T) #normalize with counts per million reads
+#rename samples
+sample_names <- c("T0", "T1", "T2", "T4", "T5", "T6", "T7", "T8", "T9","N1", "N2", "N3")
+colnames(luminal_cpm) <- sample_names
+```
+
+
+##### Prostate
+
+```{r}
+y <- DGEList(prostate) #create DGE object
+y <- calcNormFactors(y) 
+prostate_cpm <- cpm(y, log=T) #normalize with counts per million reads
+```
+
+
+## RSI and GARD calculation
+
+Using the normalized transcript count dataframe, calculates the **radiosensitivity index (RSI)** and **genomically adjusted raditherapy dose (GARD)** for each sample in the dataframe.
+
+```{r}
+#calculate RSI for each sample in a normalized gene expression df
+calc_RSI_GARD<-function(geneExpr.df){
+  
+  #10 genes for RSI calculation
+  rsi_genes <- c("AR", "JUN", "STAT1", "PRKCB", "RELA", "ABL1", "SUMO1", "CDK1", "HDAC1", "IRF1")
+  
+  #samples as rows and take the rsi gene entries
+  rsi.all <- as.data.frame(t(geneExpr.df[which(rownames(geneExpr.df) %in% rsi_genes),]))
+  #retrive gene expression for a given gene + sample number
+  getExp <- function(gene, samplenum){
+    expression = as.numeric(rsi.all[,which(colnames(rsi.all) == gene)][samplenum])
+    return(expression)
+  }
+  
+  rsi.all$RSI <- 0
+  #calculate RSI for each sample in df 
+  for(i in 1:nrow(rsi.all)){
+    T1 = -0.0098009*getExp("AR", i) #AR
+    T2 = 0.0128283*getExp("JUN", i) #JUN
+    T3 = 0.0254522*getExp("STAT1", i) #STAT1
+    T4 = -0.0017589*getExp("PRKCB", i) #PRKCB
+    T5 = -0.0038171*getExp("RELA", i) #RELA
+    T6 = 0.1070213*getExp("ABL1", i) #ABL1
+    T7 = -0.0002509*getExp("SUMO1", i) #SUMO1
+    T8 = -0.0092431*getExp("CDK1", i) #CDK1
+    T9 = -0.0204469*getExp("HDAC1", i) #HDAC1
+    T10 = -0.0441683*getExp("IRF1", i)  #IRF1
+    
+    RSI = T1 + T2 + T3 + T4 + T5 + T6 + T7 + T8 + T9 + T10
+    #add RSI value for each sample in dataframe
+    rsi.all[i,]$RSI <- RSI
+  }
+  
+  rsi.all<-add_column(rsi.all, 'alpha' = NA)
+  rsi.all<-add_column(rsi.all, 'gard'  = NA)
+  #dosage(Gray)
+  d=2
+  #n fractions
+  n=25
+
+  rsi.all <- rsi.all %>%
+    mutate(alpha=log(RSI)/(-2) - 0.05*2) %>%
+    mutate(gard=n*d*(alpha + 0.05*d))
+  
+return(rsi.all)
+}
+
+```
+
+### Calculate RSI and GARD using Normalized gene expression data
+
+```{r}
+luminal_RSI <- calc_RSI_GARD(luminal_cpm) #calculate RSI with normalized counts
+prostate_RSI <- calc_RSI_GARD(prostate_cpm) #calculate RSI with normalized counts
+```
+
+## Data Visualisation
+
+### Luminal
+
+
+```{r}
+#cRenaming samples if needed
+rownames(luminal_RSI) <- c("T0", "T1", "T2", "T4", "T5", "T6", "T7", "T8", "T9","N1", "N2", "N3")
+#change samples name to match
+rownames(samples_l) <- c("T0", "T1", "T2", "T4", "T5", "T6", "T7", "T8", "T9","N1", "N2", "N3")
+#merge rsi.all and samples by row (samples).
+luminal_RSI <- merge(luminal_RSI, samples_l, by=0)
+#merge creates 'row.names' column, revert rownames back to samples
+colnames(luminal_RSI)[1] <- 'sample'
+```
+
+
+#### Boxplot
+
+Boxplot of luminal breast cancer RSI values for 10 tumour samples and 3 adjacent normal samples.
+
+```{r}
+green <- "#D3E4D0"
+orange <- "#DBA237"
+colours <- c(green, orange)
+
+g1 <- ggplot(luminal_RSI, aes(x=condition, y=RSI, fill=condition)) +
+  
+  geom_boxplot()  +
+  scale_fill_manual(values=colours) +
+  scale_y_continuous(
+      limits = c(0.2, 0.6),
+      breaks = seq(0.2,0.6, by =.1)) +
+
+  theme_bw() +
+  ggtitle("Luminal B: RSI: Normal vs. Tumour") +
+  theme(
+      axis.line.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      axis.line.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.title.x = element_blank(),
+      axis.title.y = element_blank(),
+      legend.position = "none",
+      panel.grid.major.y = element_line(size = 0.2, linetype = 'solid',colour = "lightgrey")
+    )
+
+g1
+```
+
+
+#### RSI scatterplot
+
+Produce a scatterplot of the **RSI** across all samples in the dataset. 
+
+```{r}
+#change rownames to column for ggplot
+luminal_RSI <- rownames_to_column(luminal_RSI, "sample")
+```
+
+```{r}
+#manual colour setting
+col <- c(rep(green, 3),rep(orange, 9))
+
+g2 <- ggplot(luminal_RSI, aes(x=sample, y=RSI, color = sample)) +
+  geom_point() +
+  
+  scale_colour_manual(values=col) +
+  scale_y_continuous(
+      limits = c(0, 0.6),
+      breaks = seq(0,0.6, by =.1)) +
+  
+  theme_bw() +
+  
+  ggtitle("Luminal B RSI: All Samples") +
+  
+  theme(
+      axis.line.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      axis.line.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.title.x = element_blank(),
+      legend.position = "none",
+      #plot.margin = margin(3, 6, 3, 3),
+      panel.grid.major.y = element_line(size = 0.2, linetype = 'solid',colour = "lightgrey"),
+      panel.grid.minor.y = element_blank()
+    )
+
+g2
+```
+
+
+```{r}
+#use cowplot:plot_grid for grid plot layout
+g_grid <- plot_grid(g2, g1, labels = "AUTO")
+g_grid
+```
+
+
+### Prostate
+
+#### Manipulate for grouped bar plot
+
+```{r}
+#match rows of RSI matrix to samples
+m <- match(rownames(prostate_RSI),rownames(samples_p))
+#label samples by title e.g. 'T1' 
+prostate_RSI$title <- samples_p$Title[m]
+#label samples by condition e.g. 'tumour'
+prostate_RSI$condition <- samples_p$condition[m]
+#title as rownames
+rownames(prostate_RSI) <- prostate_RSI$title
+prostate_RSI$title <- NULL
+#patient number
+prostate_RSI$patient <- paste0("P", as.numeric(gsub("([0-9]+).*$", "\\1", rownames(prostate_RSI))))
+#order patients for plot
+level_order <- c("P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "P13", "P14" )
+```
+
+
+### Grouped Bar Plot
+
+```{r}
+g3 <- ggplot(prostate_RSI, 
+             aes(x=factor(patient, levels = level_order), 
+                 y=RSI, 
+                 group=condition, 
+                 fill=condition)) +
+               
+               
+  geom_bar(stat="identity", position = "dodge") + 
+
+  scale_fill_manual(values=colours,
+                    name = NULL) +
+  
+  scale_y_continuous(
+      limits = c(0, 0.6),
+      breaks = seq(0, 0.6, by =.1)) +
+  
+  geom_hline(yintercept = 0.4, linetype='dotted') +
+  geom_hline(yintercept = 0.6, linetype='dotted') +
+  
+  theme_bw() +
+  ggtitle("Prostate: RSI: Normal vs Tumour") +
+  ylab("RSI")+
+  
+  ggtitle("Prostate: RSI Tumour vs. Normal") +
+
+  
+  theme(
+      axis.line.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      axis.line.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.title.x = element_blank(),
+      legend.text = element_text(size=8),
+      legend.title = element_blank(),
+      legend.position = c(0.85,0.85),
+      legend.key.size = unit(0.8,"line"),
+      panel.grid.major.y = element_line(size = 0.2, linetype = 'solid',colour = "lightgrey")
+    ) 
+
+g3 
+```
+
+
+### Box Plot
+
+```{r}
+g4 <-  ggplot(prostate_RSI, aes(x=condition, y=RSI, fill=condition)) +
+  
+ geom_boxplot() +
+  scale_fill_manual(values=c(green, orange)) +
+  scale_y_continuous(
+      limits = c(0.2, 0.6),
+      breaks = seq(0.2,0.6, by =0.1)) +
+  xlab("Condition") +
+  ylab("RSI") +
+  ggtitle("Prostate: RSI: Normal vs Tumour") +
+  
+  theme_bw() +
+  theme(
+      axis.line.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      axis.line.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.title.x = element_blank(),
+      legend.position = 'none',
+      panel.grid.major.y = element_line(size = 0.2, linetype = 'solid',colour = "lightgrey")
+    )
+  
+  
+g4
+```
+
+
+```{r}
+#use cowplot:plot_grid for grid plot layout
+box_grid <- plot_grid(g4, g1, labels = "AUTO")
+box_grid
+```
+
+
+## Statistical Analysis for RSI Tumour v Normal
+
+### Luminal
+
+
+```{r}
+tumour_l <- luminal_RSI[which(luminal_RSI$condition=="tumour"),]
+normal_l <- luminal_RSI[which(luminal_RSI$condition=="normal"),]
+#Welches T test
+t.test(tumour_l$RSI, normal_l$RSI)
+```
+
+### Prostate
+
+```{r}
+tumour_p <- prostate_RSI[which(prostate_RSI$condition=="tumour"),]
+normal_p <- prostate_RSI[which(prostate_RSI$condition=="normal"),]
+#Welches T test
+t.test(tumour_p$RSI, normal_p$RSI)
+```
+
+### Luminal and Prostate
+
+```{r}
+luminal_RSI$cancer_type <- 'Breast'
+luminal_RSI$patient <- 'P1'
+prostate_RSI$cancer_type <- 'Prostate'
+prostate_RSI$replicate <- 1
+prostate_RSI$sample <- rownames(prostate_RSI)
+#combine both dataframes
+lum_pros <- rbind(luminal_RSI, prostate_RSI)
+```
+
+#### T.test across breast and prostate
+
+```{r}
+tumour <- lum_pros[which(lum_pros$condition=="tumour"),]
+normal <- lum_pros[which(lum_pros$condition=="normal"),]
+#Welches T test
+t.test(tumour$RSI, normal$RSI)
+```
+
+#### One-way ANOVA 
+
+A one-way analysis of variance (ANOVA) test was used to determine statistical difference between the independent variable (RSI) and the dependent variables (tumour/normal and cancer type). 
+
+```{r}
+attach(lum_pros)
+anova_lum_pros <-anova(lm(RSI ~ condition + cancer_type))
+```
+
+```{r}
+#create table
+xtable(anova_lum_pros)
+```
+
+
+
